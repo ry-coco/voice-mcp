@@ -2,7 +2,8 @@
  * voice-mcp
  * 
  * An MCP server for AI voice synthesis with inline audio player.
- * Supports MiniMax TTS API with custom voice cloning.
+ * Proxies TTS through a VPS relay (which calls ElevenLabs) with a custom
+ * cloned voice — ElevenLabs blocks Cloudflare Workers' datacenter IPs directly.
  * 
  * GitHub: https://github.com/garan0613/voice-mcp
  * License: MIT
@@ -17,28 +18,12 @@ import { z } from "zod";
 // =============================================================================
 
 export interface Env {
-  // MiniMax API credentials
-  MINIMAX_API_KEY: string;
-  MINIMAX_GROUP_ID: string;
-  VOICE_ID: string;
+  // Optional: VPS relay endpoint that performs the actual TTS (defaults below)
+  SPEAK_API_URL?: string;
   // Optional: custom bot name for display
   BOT_NAME?: string;
-}
-
-interface T2AResponse {
-  data?: {
-    audio?: string;
-    status?: number;
-  };
-  extra_info?: {
-    audio_length?: number;
-    audio_sample_rate?: number;
-    audio_size?: number;
-  };
-  base_resp?: {
-    status_code: number;
-    status_msg: string;
-  };
+  // Optional: secret for signing OAuth codes/tokens (falls back to a default)
+  OAUTH_SIGNING_SECRET?: string;
 }
 
 // =============================================================================
@@ -47,6 +32,14 @@ interface T2AResponse {
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
 const VOICE_RESOURCE_URI = "ui://voice-mcp/player.html";
+const DEFAULT_BOT_NAME = "daddy";
+// VPS relay that calls ElevenLabs and returns raw MP3 (GET ?text=...).
+const DEFAULT_SPEAK_API_URL = "https://ke-yu.top/speak-api";
+
+// OAuth
+const OAUTH_CODE_TTL = 600;                    // authorization code: 10 minutes
+const OAUTH_TOKEN_TTL = 60 * 60 * 24 * 30;     // access token: 30 days
+const DEFAULT_OAUTH_SECRET = "voice-mcp-oauth-signing-key-v1";
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
@@ -326,58 +319,42 @@ function getPlayerHTML(botName: string): string {
 }
 
 // =============================================================================
-// MiniMax API Helper
+// Voice Relay Helper
 // =============================================================================
+//
+// ElevenLabs blocks Cloudflare Workers' datacenter IPs (flagged as proxy/VPN),
+// so TTS is proxied through a VPS relay. The relay calls ElevenLabs itself and
+// returns raw MP3 bytes for `GET {SPEAK_API_URL}?text=...`.
 
 async function generateAudio(env: Env, text: string): Promise<{ success: boolean; audio_base64?: string; error?: string }> {
   try {
-    const t2aUrl = `https://api.minimaxi.com/v1/t2a_v2?GroupId=${env.MINIMAX_GROUP_ID}`;
-    
-    const response = await fetch(t2aUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${env.MINIMAX_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'speech-2.8-hd',
-        text: text,
-        stream: false,
-        voice_setting: {
-          voice_id: env.VOICE_ID,
-          speed: 1.0,
-          vol: 1.0,
-          pitch: 0,
-        },
-        audio_setting: {
-          sample_rate: 32000,
-          format: 'mp3',
-        },
-      }),
-    });
+    const relayBase = env.SPEAK_API_URL || DEFAULT_SPEAK_API_URL;
+    const relayUrl = `${relayBase}?text=${encodeURIComponent(text)}`;
 
-    const data = await response.json() as T2AResponse;
-    
-    if (data.base_resp && data.base_resp.status_code !== 0) {
-      return { success: false, error: data.base_resp.status_msg };
-    }
+    const response = await fetch(relayUrl);
 
-    if (data.data?.audio) {
-      const hexString = data.data.audio;
-      const bytes = new Uint8Array(hexString.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-      
-      let binary = '';
-      const chunkSize = 8192;
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        const chunk = bytes.slice(i, i + chunkSize);
-        binary += String.fromCharCode.apply(null, Array.from(chunk));
+    if (!response.ok) {
+      let errMsg = `Voice relay error (${response.status})`;
+      try {
+        const body = (await response.text()).trim();
+        if (body) errMsg += `: ${body.slice(0, 300)}`;
+      } catch {
+        // Non-text body; keep the status-based message.
       }
-      const base64Audio = btoa(binary);
-      
-      return { success: true, audio_base64: base64Audio };
+      return { success: false, error: errMsg };
     }
 
-    return { success: false, error: 'Failed to generate audio' };
+    const bytes = new Uint8Array(await response.arrayBuffer());
+
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.slice(i, i + chunkSize);
+      binary += String.fromCharCode.apply(null, Array.from(chunk));
+    }
+    const base64Audio = btoa(binary);
+
+    return { success: true, audio_base64: base64Audio };
   } catch (e) {
     return { success: false, error: e instanceof Error ? e.message : String(e) };
   }
@@ -388,7 +365,7 @@ async function generateAudio(env: Env, text: string): Promise<{ success: boolean
 // =============================================================================
 
 function createVoiceServer(env: Env): McpServer {
-  const botName = env.BOT_NAME || 'AI';
+  const botName = env.BOT_NAME || DEFAULT_BOT_NAME;
   const PLAYER_HTML = getPlayerHTML(botName);
   
   const server = new McpServer({
@@ -469,6 +446,201 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
+// =============================================================================
+// OAuth 2.0 (discovery + RFC 7591 dynamic client registration + PKCE)
+// =============================================================================
+//
+// Claude.ai connects to remote MCP servers over OAuth. This implements the
+// minimal standards-compliant flow it expects: discovery metadata, dynamic
+// client registration, and a PKCE authorization_code grant that auto-approves.
+// There are no user accounts — anyone who completes the flow receives a bearer
+// token that /mcp accepts. Modeled on ke-yu.top's implementation.
+
+function oauthSecret(env: Env): string {
+  return env.OAUTH_SIGNING_SECRET || DEFAULT_OAUTH_SECRET;
+}
+
+const jsonHeaders = { 'Content-Type': 'application/json', ...corsHeaders };
+
+function b64urlFromBytes(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlFromString(str: string): string {
+  return b64urlFromBytes(new TextEncoder().encode(str));
+}
+
+function stringFromB64url(b64url: string): string {
+  const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64.length % 4 ? '='.repeat(4 - (b64.length % 4)) : '';
+  const binary = atob(b64 + pad);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+async function sha256b64url(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return b64urlFromBytes(new Uint8Array(digest));
+}
+
+async function hmacSign(message: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return b64urlFromBytes(new Uint8Array(sig));
+}
+
+// A self-contained signed token: base64url(payload) + "." + signature.
+// Lets /token and /mcp validate codes/tokens without any server-side storage
+// (Workers isolates are ephemeral and don't share memory).
+async function signPayload(payload: Record<string, unknown>, secret: string): Promise<string> {
+  const body = b64urlFromString(JSON.stringify(payload));
+  return `${body}.${await hmacSign(body, secret)}`;
+}
+
+async function verifyPayload(token: string, secret: string): Promise<Record<string, any> | null> {
+  const dot = token.lastIndexOf('.');
+  if (dot < 0) return null;
+  const body = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  if (sig !== await hmacSign(body, secret)) return null;
+  try {
+    const payload = JSON.parse(stringFromB64url(body));
+    if (typeof payload.exp === 'number' && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function oauthMetadata(origin: string) {
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/oauth/authorize`,
+    token_endpoint: `${origin}/oauth/token`,
+    registration_endpoint: `${origin}/oauth/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'],
+  };
+}
+
+function protectedResourceMetadata(origin: string) {
+  return { resource: origin, authorization_servers: [origin] };
+}
+
+// RFC 7591 Dynamic Client Registration — public client, no secret issued.
+async function handleRegister(request: Request): Promise<Response> {
+  let body: any = {};
+  try { body = await request.json(); } catch { /* tolerate empty/invalid body */ }
+
+  const registration = {
+    client_id: crypto.randomUUID(),
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris : [],
+    token_endpoint_auth_method: 'none',
+    grant_types: ['authorization_code'],
+    response_types: ['code'],
+    ...(body.client_name ? { client_name: body.client_name } : {}),
+    ...(body.scope ? { scope: body.scope } : {}),
+  };
+  return new Response(JSON.stringify(registration), { status: 201, headers: jsonHeaders });
+}
+
+// Authorization endpoint — auto-approves and redirects back with a code that
+// carries the PKCE challenge so /token can verify it statelessly.
+async function handleAuthorize(url: URL, env: Env): Promise<Response> {
+  const p = url.searchParams;
+  const redirectUri = p.get('redirect_uri');
+  if (!redirectUri) {
+    return new Response('Missing redirect_uri', { status: 400, headers: corsHeaders });
+  }
+
+  let dest: URL;
+  try {
+    dest = new URL(redirectUri);
+  } catch {
+    return new Response('Invalid redirect_uri', { status: 400, headers: corsHeaders });
+  }
+
+  const code = await signPayload({
+    cc: p.get('code_challenge'),
+    m: p.get('code_challenge_method') || 'plain',
+    ru: redirectUri,
+    exp: Math.floor(Date.now() / 1000) + OAUTH_CODE_TTL,
+  }, oauthSecret(env));
+
+  dest.searchParams.set('code', code);
+  const state = p.get('state');
+  if (state) dest.searchParams.set('state', state);
+  return Response.redirect(dest.toString(), 302);
+}
+
+// Token endpoint — exchanges an authorization code for an access token,
+// verifying PKCE and redirect_uri.
+async function handleToken(request: Request, env: Env): Promise<Response> {
+  const secret = oauthSecret(env);
+  const err = (error: string, desc?: string) => new Response(
+    JSON.stringify({ error, ...(desc ? { error_description: desc } : {}) }),
+    { status: 400, headers: jsonHeaders },
+  );
+
+  // Token endpoint uses form encoding per spec; also accept JSON defensively.
+  let params: Record<string, string> = {};
+  try {
+    if ((request.headers.get('content-type') || '').includes('application/json')) {
+      params = await request.json() as Record<string, string>;
+    } else {
+      (await request.formData()).forEach((v, k) => { params[k] = String(v); });
+    }
+  } catch {
+    return err('invalid_request', 'Unable to parse request body');
+  }
+
+  if (params.grant_type !== 'authorization_code') return err('unsupported_grant_type');
+  if (!params.code) return err('invalid_request', 'Missing code');
+
+  const payload = await verifyPayload(params.code, secret);
+  if (!payload) return err('invalid_grant', 'Invalid or expired code');
+
+  if (params.redirect_uri && payload.ru && params.redirect_uri !== payload.ru) {
+    return err('invalid_grant', 'redirect_uri mismatch');
+  }
+
+  // PKCE verification.
+  if (payload.cc) {
+    const verifier = params.code_verifier;
+    if (!verifier) return err('invalid_grant', 'Missing code_verifier');
+    const ok = payload.m === 'S256'
+      ? (await sha256b64url(verifier)) === payload.cc
+      : verifier === payload.cc;
+    if (!ok) return err('invalid_grant', 'PKCE verification failed');
+  }
+
+  const accessToken = await signPayload({
+    sub: 'voice-mcp',
+    exp: Math.floor(Date.now() / 1000) + OAUTH_TOKEN_TTL,
+  }, secret);
+
+  return new Response(JSON.stringify({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: OAUTH_TOKEN_TTL,
+  }), { headers: jsonHeaders });
+}
+
+async function isAuthorized(request: Request, env: Env): Promise<boolean> {
+  const m = (request.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
+  if (!m) return false;
+  return (await verifyPayload(m[1], oauthSecret(env))) !== null;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -478,8 +650,41 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // MCP Endpoint
+    // OAuth discovery metadata (also served on path-suffixed variants that
+    // some clients probe, e.g. /.well-known/oauth-protected-resource/mcp).
+    if (path.startsWith('/.well-known/oauth-authorization-server')) {
+      return Response.json(oauthMetadata(url.origin), { headers: corsHeaders });
+    }
+    if (path.startsWith('/.well-known/oauth-protected-resource')) {
+      return Response.json(protectedResourceMetadata(url.origin), { headers: corsHeaders });
+    }
+
+    // OAuth flow
+    if (path === '/oauth/register' && request.method === 'POST') {
+      return handleRegister(request);
+    }
+    if (path === '/oauth/authorize' && request.method === 'GET') {
+      return handleAuthorize(url, env);
+    }
+    if (path === '/oauth/token' && request.method === 'POST') {
+      return handleToken(request, env);
+    }
+
+    // MCP Endpoint (requires a bearer token; an unauthenticated request gets a
+    // 401 challenge that kicks off the OAuth flow above).
     if (path === '/mcp' || path === '/mcp/' || path === '/sse') {
+      if (!(await isAuthorized(request, env))) {
+        return new Response(
+          JSON.stringify({ error: 'invalid_token', error_description: 'Authentication required' }),
+          {
+            status: 401,
+            headers: {
+              ...jsonHeaders,
+              'WWW-Authenticate': `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"`,
+            },
+          },
+        );
+      }
       const server = createVoiceServer(env);
       const handler = createMcpHandler(server, {
         route: null as unknown as string,
@@ -495,7 +700,7 @@ export default {
         status: 'ok',
         service: 'voice-mcp',
         version: '1.0.0',
-        voice_id: env.VOICE_ID ? 'configured' : 'not configured',
+        relay: env.SPEAK_API_URL || DEFAULT_SPEAK_API_URL,
       }, { headers: corsHeaders });
     }
 
@@ -535,7 +740,7 @@ export default {
 
     // Landing page
     if (path === '/' || path === '') {
-      const botName = env.BOT_NAME || 'AI';
+      const botName = env.BOT_NAME || DEFAULT_BOT_NAME;
       return new Response(
         `<!DOCTYPE html>
 <html><head>

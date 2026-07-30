@@ -3,6 +3,11 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
+  "alias": {
+    // `agents` dynamically imports the optional `ai` SDK in its MCP client path,
+    // which this server-only worker never executes. Stub it so bundling succeeds.
+    "ai": "./src/ai-stub.js"
+  },
   "observability": {
     "enabled": true
   }

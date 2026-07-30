@@ -6,7 +6,7 @@ An MCP (Model Context Protocol) server for AI voice synthesis with an inline aud
 
 ## Features
 
-- 🎤 **Custom Voice Cloning** — Use MiniMax TTS API with your own cloned voice
+- 🎤 **Custom Voice Cloning** — Use ElevenLabs TTS API with your own cloned voice
 - 🎵 **Inline Audio Player** — Beautiful WeChat-style player with waveform visualization
 - 📝 **Transcript Toggle** — Show/hide the spoken text
 - 🌙 **Dark Mode Support** — Automatic theme adaptation
@@ -35,18 +35,20 @@ cd voice-mcp
 npm install
 ```
 
-### 3. Configure MiniMax API
+### 3. Configure
 
-You'll need a MiniMax account with voice cloning enabled.
+TTS is performed by a **VPS relay** (which calls ElevenLabs), because ElevenLabs
+blocks Cloudflare Workers' datacenter IPs directly. The worker itself needs no
+ElevenLabs credentials — the relay holds them.
 
-Add your secrets to Cloudflare:
+Optionally override the relay URL or display name:
 
 ```bash
-npx wrangler secret put MINIMAX_API_KEY
-npx wrangler secret put MINIMAX_GROUP_ID
-npx wrangler secret put VOICE_ID
-npx wrangler secret put BOT_NAME  # Optional, defaults to "AI"
+npx wrangler secret put SPEAK_API_URL  # Optional, defaults to https://ke-yu.top/speak-api
+npx wrangler secret put BOT_NAME       # Optional, defaults to "daddy"
 ```
+
+The relay must accept `GET {SPEAK_API_URL}?text=...` and return raw MP3 audio.
 
 ### 4. Deploy
 
@@ -64,10 +66,9 @@ npx wrangler deploy
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MINIMAX_API_KEY` | ✅ | Your MiniMax API key |
-| `MINIMAX_GROUP_ID` | ✅ | Your MiniMax group ID |
-| `VOICE_ID` | ✅ | The cloned voice ID |
-| `BOT_NAME` | ❌ | Display name (default: "AI") |
+| `SPEAK_API_URL` | ❌ | VPS relay endpoint (default: `https://ke-yu.top/speak-api`) |
+| `BOT_NAME` | ❌ | Display name (default: "daddy") |
+| `OAUTH_SIGNING_SECRET` | ❌ | Secret for signing OAuth tokens (has a default) |
 
 ## API Endpoints
 
@@ -79,8 +80,8 @@ npx wrangler deploy
 
 ## How to Clone a Voice
 
-1. Go to [MiniMax Console](https://platform.minimaxi.com/)
-2. Navigate to Voice Cloning
+1. Go to [ElevenLabs](https://elevenlabs.io/)
+2. Navigate to Voice Lab → Voice Cloning
 3. Upload 10-30 seconds of clear audio
 4. Wait for processing (usually a few minutes)
 5. Copy the Voice ID
@@ -113,7 +114,7 @@ The core MCP logic can be adapted for other platforms. You'll need to:
 
 - [Cloudflare Workers](https://workers.cloudflare.com/) — Serverless runtime
 - [MCP SDK](https://github.com/modelcontextprotocol/sdk) — Model Context Protocol
-- [MiniMax TTS](https://platform.minimaxi.com/) — Voice synthesis
+- [ElevenLabs TTS](https://elevenlabs.io/) — Voice synthesis
 - [ext-apps](https://modelcontextprotocol.io/docs/concepts/ext-apps) — Inline UI rendering
 
 ## License

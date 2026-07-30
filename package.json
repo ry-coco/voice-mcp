@@ -26,7 +26,7 @@
     "text-to-speech",
     "ai",
     "claude",
-    "minimax"
+    "elevenlabs"
   ],
   "license": "MIT"
 }
