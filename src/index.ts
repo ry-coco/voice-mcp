@@ -671,8 +671,9 @@ export default {
     }
 
     // MCP Endpoint (requires a bearer token; an unauthenticated request gets a
-    // 401 challenge that kicks off the OAuth flow above).
-    if (path === '/mcp' || path === '/mcp/' || path === '/sse') {
+    // 401 challenge that kicks off the OAuth flow above). The Streamable HTTP
+    // transport only serves /mcp.
+    if (path === '/mcp' || path === '/mcp/') {
       if (!(await isAuthorized(request, env))) {
         return new Response(
           JSON.stringify({ error: 'invalid_token', error_description: 'Authentication required' }),

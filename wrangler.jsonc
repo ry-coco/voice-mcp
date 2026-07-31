@@ -3,6 +3,12 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Custom domain — wrangler auto-provisions the DNS record + SSL cert. A fresh
+  // origin so Claude.ai does clean OAuth discovery (it cached the pre-OAuth
+  // failure against the *.workers.dev origin).
+  "routes": [
+    { "pattern": "voice.ke-yu.top", "custom_domain": true }
+  ],
   "alias": {
     // `agents` dynamically imports the optional `ai` SDK in its MCP client path,
     // which this server-only worker never executes. Stub it so bundling succeeds.
